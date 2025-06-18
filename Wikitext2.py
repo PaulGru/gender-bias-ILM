@@ -17,11 +17,13 @@ from invariant_distilbert import InvariantDistilBertForMaskedLM
 # === PARAMETERS ===
 generated_root = "generated_splits"
 bias_output_root = "bias_outputs_2500"
+os.makedirs(generated_root, exist_ok=True)
 os.makedirs(bias_output_root, exist_ok=True)
 
 learning_rates = [1e-5, 5e-5]
 seeds = [0, 1, 2, 3, 4]
-p_values = [0.1, 0.25, 0.5, 0.7, 0.9]
+# Tailles relatives de B par rapport à A en pourcentage
+rel_sizes = [10, 25, 30, 50, 70, 75, 90, 100]
 steps_list = [10, 50, 100, 200, 1000, 2500]
 methods = ["eLM", "iLM"]
 model_type = "distilbert-base-uncased"
@@ -49,8 +51,8 @@ GENDER_PAIRS = [
     ("hero", "heroine"), ("heroes", "heroines"),
     ("grandson", "granddaughter"), ("grandsons", "granddaughters"),
 ]
-GENDER_DICT = {w1.lower(): w2.lower() for w1, w2 in GENDER_PAIRS}
-GENDER_DICT.update({w2.lower(): w1.lower() for w1, w2 in GENDER_PAIRS})
+GENDER_DICT = {w1: w2 for w1, w2 in GENDER_PAIRS}
+GENDER_DICT.update({w2: w1 for w1, w2 in GENDER_PAIRS})
 
 
 def swap_gender_terms(sentence, gender_dict):
@@ -60,6 +62,7 @@ def swap_gender_terms(sentence, gender_dict):
         low = token.lower()
         if low in gender_dict:
             sub = gender_dict[low]
+            # preserve capitalization
             if token[0].isupper():
                 sub = sub.capitalize()
             swapped.append(sub)
@@ -70,39 +73,42 @@ def swap_gender_terms(sentence, gender_dict):
 
 def prepare_split(dataset, seed, p_env_a, output_dir):
     """
-    Create two environments A (p_env_a fraction of original train) and B (remaining, swapped genders) and
-    write to files under output_dir.
+    Create two environments A (p_env_a fraction of original train) and B (remaining, swapped genders)
+    and write to files under output_dir.
     """
-    os.makedirs(output_dir, exist_ok=True)
+    # create output directories
+    train_env = os.path.join(output_dir, 'train_env')
+    val_env = os.path.join(output_dir, 'val_env')
+    os.makedirs(train_env, exist_ok=True)
+    os.makedirs(val_env, exist_ok=True)
+
+    # load lines
     train_lines = [l.strip() for l in dataset['train']['text'] if l.strip()]
     val_lines   = [l.strip() for l in dataset['validation']['text'] if l.strip()]
     test_lines  = [l.strip() for l in dataset['test']['text'] if l.strip()]
 
+    # deterministic split by slicing after shuffle
     random.seed(seed)
-    env_a, env_b = [], []
-    for line in tqdm(train_lines, desc=f"Split seed={seed}, p={p_env_a}"):
-        if random.random() < p_env_a:
-            env_a.append(line)
-        else:
-            env_b.append(swap_gender_terms(line, GENDER_DICT))
+    random.shuffle(train_lines)
+    n = len(train_lines)
+    n_a = int(p_env_a * n)
+    env_a = train_lines[:n_a]
+    env_b = [swap_gender_terms(l, GENDER_DICT) for l in train_lines[n_a:]]
 
-    # write train env
-    train_env = os.path.join(output_dir, 'train_env')
-    val_env   = os.path.join(output_dir, 'val_env')
-    os.makedirs(train_env, exist_ok=True)
-    os.makedirs(val_env, exist_ok=True)
-
-    with open(os.path.join(train_env, 'env_A.txt'), 'w') as f:
+    # write train environments
+    with open(os.path.join(train_env, 'env_A.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(env_a))
-    with open(os.path.join(train_env, 'env_B.txt'), 'w') as f:
+    with open(os.path.join(train_env, 'env_B.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(env_b))
-    with open(os.path.join(output_dir, 'all_train.txt'), 'w') as f:
+
+    # write combined train file
+    with open(os.path.join(output_dir, 'all_train.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(env_a + env_b))
 
-    # write validation/test
-    with open(os.path.join(val_env, 'val_ind.txt'), 'w') as f:
+    # write validation and test
+    with open(os.path.join(val_env, 'val_ind.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(val_lines))
-    with open(os.path.join(val_env, 'test.txt'), 'w') as f:
+    with open(os.path.join(val_env, 'test.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(test_lines))
 
 
@@ -126,7 +132,8 @@ def compute_bias(model, tokenizer, test_lines):
         inputs = tokenizer(masked, return_tensors='pt')
         if use_cuda:
             inputs = {k: v.to('cuda') for k, v in inputs.items()}
-        with torch.no_grad(): out = model(**inputs)
+        with torch.no_grad():
+            out = model(**inputs)
         mask_idx = (inputs['input_ids'] == tokenizer.mask_token_id).nonzero(as_tuple=True)
         if len(mask_idx[0]) == 0:
             continue
@@ -142,7 +149,7 @@ def compute_bias(model, tokenizer, test_lines):
         if p1 + p2 < 1e-8:
             continue
         p = p1 / (p1 + p2)
-        H = 0 if p in (0,1) else - (p * math.log2(p) + (1-p) * math.log2(1-p))
+        H = 0 if p in (0, 1) else - (p * math.log2(p) + (1 - p) * math.log2(1 - p))
         scores.append(1 - H)
     return scores
 
@@ -153,40 +160,40 @@ def main():
     dataset = load_dataset(
         "text",
         data_files={
-            "train":      "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.train.raw",
+            "train": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.train.raw",
             "validation": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.valid.raw",
-            "test":       "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.test.raw",
+            "test": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.test.raw",
         },
-        split={
-            "train": "train",
-            "validation": "validation",
-            "test": "test"
-        }
+        split={"train": "train", "validation": "validation", "test": "test"}
     )
 
     for lr in learning_rates:
         for seed in seeds:
-            for p in p_values:
-                tag = f"split{seed}_p{str(p).replace('.', '')}"
+            for r in rel_sizes:
+                # calcul de p_env_a à partir de la taille relative r
+                p_env_a = 1.0 / (1.0 + r/100.0)
+                tag = f"split{seed}_r{r}"
                 split_dir = os.path.join(generated_root, tag)
-                prepare_split(dataset, seed, p, split_dir)
+                prepare_split(dataset, seed, p_env_a, split_dir)
 
+                # vérification du fichier test
                 test_file = os.path.join(split_dir, 'val_env', 'test.txt')
                 if not os.path.exists(test_file):
                     print(f"Missing test file for {tag}, skipping.")
                     continue
-                with open(test_file) as f:
+                with open(test_file, 'r', encoding='utf-8') as f:
                     test_lines = [l.strip() for l in f if l.strip()]
 
                 for method in methods:
                     train_folder = split_dir if method == 'eLM' else os.path.join(split_dir, 'train_env')
                     for steps in steps_list:
-
-                        model_path = os.path.join('model', f"{tag}_lr{str(lr).replace('.', '')}_steps{steps}", method)
+                        model_path = os.path.join(
+                            'model', f"{tag}_lr{str(lr).replace('.', '')}_steps{steps}_{method}"
+                        )
                         os.makedirs(model_path, exist_ok=True)
 
-                        if not os.path.isdir(model_path) or not os.listdir(model_path):
-                        
+                        # entraînement si nécessaire
+                        if not os.listdir(model_path):
                             cmd = (
                                 f"python3 run_invariant_mlm.py "
                                 f"--model_name_or_path {model_type} "
@@ -196,30 +203,28 @@ def main():
                                 f"--output_dir {model_path} "
                                 f"--seed {seed} --per_device_train_batch_size 8 "
                                 f"--preprocessing_num_workers 4 --gradient_accumulation_steps 2 "
-                                f"--use_auth_token "
                                 f"--fp16 --overwrite_output_dir"
                             )
                             print(f"Training {method} on {tag} (lr={lr}, seed={seed})...")
                             subprocess.run(cmd, shell=True, check=True)
 
-                        tokenizer = DistilBertTokenizer.from_pretrained(
-                            model_path,
-                            use_auth_token=True
-                        )
-                        model = InvariantDistilBertForMaskedLM.from_pretrained(
-                            model_path,
-                            use_auth_token=True
-                        )
+                        # évaluation du biais
+                        tokenizer = DistilBertTokenizer.from_pretrained(model_path)
+                        model = InvariantDistilBertForMaskedLM.from_pretrained(model_path)
+                        if use_cuda:
+                            model.to('cuda')
                         bias_scores = compute_bias(model, tokenizer, test_lines)
                         df = pd.DataFrame({'bias': bias_scores})
-                        out_csv = os.path.join(bias_output_root, f"{tag}_lr{str(lr).replace('.', '')}_steps{steps}_{method}.csv")
+                        out_csv = os.path.join(
+                            bias_output_root,
+                            f"{tag}_lr{str(lr).replace('.', '')}_steps{steps}_{method}.csv"
+                        )
                         df.to_csv(out_csv, index=False)
                         print(f"Saved bias scores to {out_csv}")
 
                         # Remove saved model to free disk space
-                        if os.path.isdir(model_path):
-                            shutil.rmtree(model_path)
-                            print(f"Removed model directory {model_path} to free up disk space.")
+                        shutil.rmtree(model_path)
+                        
 
 if __name__ == '__main__':
     main()
