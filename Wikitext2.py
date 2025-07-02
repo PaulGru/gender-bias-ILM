@@ -13,62 +13,76 @@ import pandas as pd
 from datasets import load_dataset
 from transformers import DistilBertTokenizer
 from invariant_distilbert import InvariantDistilBertForMaskedLM
+from huggingface_hub import hf_hub_download
+from datasets import Dataset
+
 
 # === PARAMETERS ===
 generated_root = "generated_splits"
-bias_output_root = "bias_outputs_2500"
+bias_output_root = "bias_outputs_xxx"
 os.makedirs(generated_root, exist_ok=True)
 os.makedirs(bias_output_root, exist_ok=True)
 
-learning_rates = [1e-5, 5e-5]
+learning_rates = [1e-5]
 seeds = [0, 1, 2, 3, 4]
 # Tailles relatives de B par rapport à A en pourcentage
 rel_sizes = [10, 25, 30, 50, 70, 75, 90, 100]
 steps_list = [10, 50, 100, 200, 1000, 2500]
 methods = ["eLM", "iLM"]
-model_type = "distilbert-base-uncased"
 use_cuda = torch.cuda.is_available()
 
 # === GENDER PAIRS & DICTIONARY ===
 GENDER_PAIRS = [
-    ("he", "she"), ("him", "her"), ("his", "hers"),
-    ("man", "woman"), ("men", "women"),
-    ("boy", "girl"), ("boys", "girls"),
-    ("father", "mother"), ("fathers", "mothers"),
-    ("son", "daughter"), ("sons", "daughters"),
-    ("brother", "sister"), ("brothers", "sisters"),
-    ("uncle", "aunt"), ("uncles", "aunts"),
-    ("husband", "wife"), ("husbands", "wives"),
-    ("actor", "actress"), ("actors", "actresses"),
-    ("king", "queen"), ("kings", "queens"),
-    ("prince", "princess"), ("princes", "princesses"),
-    ("mr.", "mrs."), ("mr", "mrs"),
-    ("male", "female"), ("males", "females"),
+    ("actor", "actress"), ("Actor", "Actress"),
+    ("boy", "girl"), ("Boy", "Girl"),
+    ("Boys", "Girls"), ("boys", "girls"),
+    ("boyfriend", "girlfriend"), ("Boyfriend", "Girlfriend"),
+    ("father", "mother"), ("Father", "Mother"),
+    ("Fathers", "Mothers"), ("fathers", "mothers"),
+    ("Gentleman", "Lady"), ("Gentlemen", "Ladies"),
     ("gentleman", "lady"), ("gentlemen", "ladies"),
-    ("boyfriend", "girlfriend"), ("boyfriends", "girlfriends"),
-    ("stepfather", "stepmother"), ("stepfathers", "stepmothers"),
-    ("spokesman", "spokeswoman"), ("spokesmen", "spokeswomen"),
-    ("hero", "heroine"), ("heroes", "heroines"),
-    ("grandson", "granddaughter"), ("grandsons", "granddaughters"),
+    ("grandson", "granddaughter"),
+    ("he", "she"), ("He", "She"),
+    ("Him", "Her"), ("him", "her"),
+    ("his", "her"), ("His", "Her"),
+    ("hero", "heroine"),
+    ("Husband", "Wife"), ("husbands", "wives"),
+    ("King", "Queen"), ("Kings", "Queens"),
+    ("kings", "queens"), ("king", "queen"),
+    ("male", "female"), ("Male", "Female"),
+    ("males", "females"), ("Males", "Females"),
+    ("man", "woman"), ("Man", "Woman"),
+    ("men", "women"), ("Men", "Women"),
+    ("Mr.", "Mrs."),
+    ("prince", "princess"), ("Prince", "Princess"),
+    ("son", "daughter"), ("sons", "daughters"),
+    ("spokesman", "spokeswoman"),
+    ("stepfather", "stepmother"),
+    ("uncle", "aunt"),
+    ("wife", "husband")
 ]
 GENDER_DICT = {w1: w2 for w1, w2 in GENDER_PAIRS}
 GENDER_DICT.update({w2: w1 for w1, w2 in GENDER_PAIRS})
 
-
 def swap_gender_terms(sentence, gender_dict):
-    tokens = sentence.split()
+    # Découpe les tokens : mots OU ponctuation
+    tokens = re.findall(r"\w+|[^\w\s]", sentence, re.UNICODE)
+    
     swapped = []
     for token in tokens:
-        low = token.lower()
-        if low in gender_dict:
-            sub = gender_dict[low]
-            # preserve capitalization
-            if token[0].isupper():
-                sub = sub.capitalize()
-            swapped.append(sub)
+        if token in gender_dict:
+            swapped.append(gender_dict[token])
         else:
             swapped.append(token)
-    return ' '.join(swapped)
+    
+    # Reconstruire la phrase en ajoutant les espaces intelligemment
+    result = ""
+    for i, token in enumerate(swapped):
+        if i > 0 and re.match(r"\w", token) and re.match(r"\w", swapped[i-1]):
+            result += " "
+        result += token
+
+    return result
 
 
 def prepare_split(dataset, seed, p_env_a, output_dir):
@@ -101,9 +115,11 @@ def prepare_split(dataset, seed, p_env_a, output_dir):
     with open(os.path.join(train_env, 'env_B.txt'), 'w', encoding='utf-8') as f:
         f.write("\n".join(env_b))
 
+    all_train = env_a + env_b
+    random.shuffle(all_train)
     # write combined train file
     with open(os.path.join(output_dir, 'all_train.txt'), 'w', encoding='utf-8') as f:
-        f.write("\n".join(env_a + env_b))
+        f.write("\n".join(all_train))
 
     # write validation and test
     with open(os.path.join(val_env, 'val_ind.txt'), 'w', encoding='utf-8') as f:
@@ -112,60 +128,154 @@ def prepare_split(dataset, seed, p_env_a, output_dir):
         f.write("\n".join(test_lines))
 
 
-def compute_bias(model, tokenizer, test_lines):
+def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block_size=None, verbose=True):
     """
     Compute bias scores on test_lines: return list of B_H values.
     """
     scores = []
+    clean_lines = []
+    masked_targets = []
     model.eval()
     if use_cuda:
         model.to('cuda')
+    
+    # Réplication exacte de la logique run_invariant_mlm.py
+    if block_size is None:
+        block_size = tokenizer.model_max_length
+        if block_size > 1024:
+            block_size = 1024
 
     for line in tqdm(test_lines, desc="Computing bias"):
-        words = re.findall(r"\b\w+\b", line.lower())
-        found = [w for w in words if w in GENDER_DICT]
+        words = re.findall(r"\b\w+\b", line)
+        found = [w for w in words if w in gender_dict]
         if len(found) != 1:
             continue
         target = found[0]
-        opposite = GENDER_DICT[target]
+        opposite = gender_dict[target]
         masked = re.sub(rf"\b{target}\b", tokenizer.mask_token, line, flags=re.IGNORECASE)
-        inputs = tokenizer(masked, return_tensors='pt')
+        clean_lines.append(masked)
+        masked_targets.append((target, opposite))
+
+    if len(clean_lines) == 0:
+        if verbose:
+            print("[WARN] Aucune phrase valide trouvée pour l'évaluation du biais.")
+        return []
+    
+    # Étape 2 — Créer un dataset HuggingFace
+    raw_dataset = Dataset.from_dict({"text": clean_lines})
+
+    # Étape 3 — Tokenize
+    def tokenize_function(example):
+        return tokenizer(example["text"])
+
+    tokenized_dataset = raw_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+
+    # Étape 4 — Group texts à la manière de run_invariant_mlm.py
+    def group_texts(examples):
+        concatenated = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = (len(concatenated["input_ids"]) // block_size) * block_size
+        result = {
+            k: [v[i:i + block_size] for i in range(0, total_length, block_size)]
+            for k, v in concatenated.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    grouped_dataset = tokenized_dataset.map(group_texts, batched=True)
+
+    # Étape 5 — Évaluation manuelle
+    for i, example in enumerate(tqdm(grouped_dataset, desc="Computing bias")):
+
+        input_ids = torch.tensor(example["input_ids"]).unsqueeze(0)
+        attention_mask = torch.tensor(example["attention_mask"]).unsqueeze(0)
+        
         if use_cuda:
-            inputs = {k: v.to('cuda') for k, v in inputs.items()}
+            input_ids = input_ids.to('cuda')
+            attention_mask = attention_mask.to('cuda')
+        
         with torch.no_grad():
-            out = model(**inputs)
-        mask_idx = (inputs['input_ids'] == tokenizer.mask_token_id).nonzero(as_tuple=True)
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        mask_idx = (input_ids[0] == tokenizer.mask_token_id).nonzero(as_tuple=True)
         if len(mask_idx[0]) == 0:
             continue
-        logits = out.logits[mask_idx][0]
+
+        logits = out.logits[0, mask_idx[0][0]]
         probs = logits.softmax(dim=-1)
+
+        # Récupérer les bons mots cibles
         try:
-            i1 = tokenizer.convert_tokens_to_ids(target)
-            i2 = tokenizer.convert_tokens_to_ids(opposite)
+            target, opposite = masked_targets[i]
+        except IndexError:
+            continue
+
+        toks_target = tokenizer.tokenize(target)
+        toks_opposite = tokenizer.tokenize(opposite)
+        
+        if len(toks_target) != 1 or len(toks_opposite) != 1:
+            continue
+
+        try:
+            i1 = tokenizer.convert_tokens_to_ids(toks_target[0])
+            i2 = tokenizer.convert_tokens_to_ids(toks_opposite[0])
+            
             p1 = probs[i1].item()
             p2 = probs[i2].item()
         except:
             continue
+
         if p1 + p2 < 1e-8:
             continue
         p = p1 / (p1 + p2)
         H = 0 if p in (0, 1) else - (p * math.log2(p) + (1 - p) * math.log2(1 - p))
         scores.append(1 - H)
+    
+    if verbose:
+        print(f"[INFO] Phrases retenues : {len(scores)} / {len(test_lines)}")
+        if scores:
+            print(f"[INFO] Biais moyen (1 - H) : {sum(scores) / len(scores):.4f}")
+            
     return scores
 
 
 def main():
-    # load dataset once
-    print("Loading Wikitext-2 dataset...")
-    dataset = load_dataset(
-        "text",
-        data_files={
-            "train": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.train.raw",
-            "validation": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.valid.raw",
-            "test": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.test.raw",
-        },
-        split={"train": "train", "validation": "validation", "test": "test"}
+    # --- PRÉ-TÉLÉCHARGEMENT DES POIDS ---
+    hf_hub_download(
+        repo_id="distilbert-base-uncased",
+        filename="pytorch_model.bin",
+        force_download=False,    # n’écrase pas le cache si déjà présent
+        resume_download=True     # reprend un téléchargement partiel
     )
+    # → ça garantira qu’au moment du `--model_name_or_path distilbert-base-uncased`
+    #   les fichiers sont déjà dans le cache, et n’iront plus frapper l’endpoint
+    #   qui renvoie 503.
+
+    # load dataset once
+    # print("Loading Wikitext-2 dataset...")
+    # dataset = load_dataset(
+    #     "text",
+    #     data_files={
+    #         "train": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.train.raw",
+    #         "validation": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.valid.raw",
+    #         "test": "/home/p.grunenwald/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/wikitext-2-raw/wiki.test.raw",
+    #     },
+    #     split={"train": "train", "validation": "validation", "test": "test"}
+    # )
+
+    print("Loading Wikitext-2 dataset…")
+
+    urls = {
+        "train":      "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1/train-00000-of-00001.parquet",
+        "validation": "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1/validation-00000-of-00001.parquet",
+        "test":       "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1/test-00000-of-00001.parquet",
+    }
+
+    dataset = load_dataset(
+        "parquet",
+        data_files=urls,
+        split   = {"train": "train", "validation": "validation", "test": "test"},
+    )
+
 
     for lr in learning_rates:
         for seed in seeds:
@@ -196,12 +306,12 @@ def main():
                         if not os.listdir(model_path):
                             cmd = (
                                 f"python3 run_invariant_mlm.py "
-                                f"--model_name_or_path {model_type} "
+                                f"--model_name_or_path distilbert-base-uncased "
                                 f"--train_file {train_folder} "
                                 f"--validation_file {os.path.join(split_dir, 'val_env', 'val_ind.txt')} "
                                 f"--do_train --do_eval --nb_steps {steps} --learning_rate {lr} "
-                                f"--output_dir {model_path} "
-                                f"--seed {seed} --per_device_train_batch_size 8 "
+                                f"--output_dir {model_path} --preprocessing_num_workers 16 "
+                                f"--seed {seed} --per_device_train_batch_size 12 "
                                 f"--preprocessing_num_workers 4 --gradient_accumulation_steps 2 "
                                 f"--fp16 --overwrite_output_dir"
                             )
@@ -209,11 +319,26 @@ def main():
                             subprocess.run(cmd, shell=True, check=True)
 
                         # évaluation du biais
-                        tokenizer = DistilBertTokenizer.from_pretrained(model_path)
-                        model = InvariantDistilBertForMaskedLM.from_pretrained(model_path)
+                        tokenizer = DistilBertTokenizer.from_pretrained(
+                            model_path,
+                            force_download=False,
+                            resume_download=False
+                        )
+                        model = InvariantDistilBertForMaskedLM.from_pretrained(
+                            model_path,
+                            force_download=False,
+                            resume_download=False
+                        )
                         if use_cuda:
                             model.to('cuda')
-                        bias_scores = compute_bias(model, tokenizer, test_lines)
+                        bias_scores = compute_bias(
+                            model=model,
+                            tokenizer=tokenizer,
+                            test_lines=test_lines,
+                            gender_dict=GENDER_DICT,  # défini quelque part globalement
+                            use_cuda=use_cuda,
+                            block_size=128            # ou 512 si c’est ce que tu utilises à l’entraînement
+                        )
                         df = pd.DataFrame({'bias': bias_scores})
                         out_csv = os.path.join(
                             bias_output_root,
