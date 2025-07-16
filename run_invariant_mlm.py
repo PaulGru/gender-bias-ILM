@@ -54,11 +54,8 @@ from transformers import (
     RobertaTokenizerFast
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
-
 RESULTS_ROOT = os.path.join(os.getcwd(), "eval_results_perplexity")
 os.makedirs(RESULTS_ROOT, exist_ok=True)
-
-
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)

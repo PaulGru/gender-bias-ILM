@@ -3,11 +3,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from collections import defaultdict
 
-means_dir      = "bias_outputs_xxx_mean"
+means_dir      = "output_bias_mean"
 plot_output_dir = "plots_par_step"
 os.makedirs(plot_output_dir, exist_ok=True)
 
-target_r_values = ["r30", "r100", None]
+target_r_values = ["r30", "r70", None]
 
 for target_r in target_r_values:
     aggregated = defaultdict(list)

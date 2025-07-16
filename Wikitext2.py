@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import random
 import subprocess
@@ -10,78 +7,77 @@ import torch
 import shutil
 from tqdm import tqdm
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import DistilBertTokenizer
 from invariant_distilbert import InvariantDistilBertForMaskedLM
 from huggingface_hub import hf_hub_download
-from datasets import Dataset
-
+import inflect
 
 # === PARAMETERS ===
 generated_root = "generated_splits"
-bias_output_root = "bias_outputs_xxx"
+bias_output_root = "output_bias_scores"
 os.makedirs(generated_root, exist_ok=True)
 os.makedirs(bias_output_root, exist_ok=True)
 
-learning_rates = [1e-5]
+learning_rates = [5e-5]
 seeds = [0, 1, 2, 3, 4]
 # Tailles relatives de B par rapport à A en pourcentage
 rel_sizes = [10, 25, 30, 50, 70, 75, 90, 100]
 steps_list = [10, 50, 100, 200, 1000, 2500]
 methods = ["eLM", "iLM"]
-use_cuda = torch.cuda.is_available()
 
-# === GENDER PAIRS & DICTIONARY ===
-GENDER_PAIRS = [
-    ("actor", "actress"), ("Actor", "Actress"),
-    ("boy", "girl"), ("Boy", "Girl"),
-    ("Boys", "Girls"), ("boys", "girls"),
-    ("boyfriend", "girlfriend"), ("Boyfriend", "Girlfriend"),
-    ("father", "mother"), ("Father", "Mother"),
-    ("Fathers", "Mothers"), ("fathers", "mothers"),
-    ("Gentleman", "Lady"), ("Gentlemen", "Ladies"),
-    ("gentleman", "lady"), ("gentlemen", "ladies"),
+# === GENDER PAIRS & DICTIONARY DYNAMIQUE ===
+# Paires de base (minuscules, singulier)
+base_pairs = [
+    ("actor", "actress"),
+    ("boy", "girl"),
+    ("boyfriend", "girlfriend"),
+    ("father", "mother"),
+    ("gentleman", "lady"),
     ("grandson", "granddaughter"),
-    ("he", "she"), ("He", "She"),
-    ("Him", "Her"), ("him", "her"),
-    ("his", "her"), ("His", "Her"),
+    ("he", "she"),
     ("hero", "heroine"),
-    ("Husband", "Wife"), ("husbands", "wives"),
-    ("King", "Queen"), ("Kings", "Queens"),
-    ("kings", "queens"), ("king", "queen"),
-    ("male", "female"), ("Male", "Female"),
-    ("males", "females"), ("Males", "Females"),
-    ("man", "woman"), ("Man", "Woman"),
-    ("men", "women"), ("Men", "Women"),
-    ("Mr.", "Mrs."),
-    ("prince", "princess"), ("Prince", "Princess"),
-    ("son", "daughter"), ("sons", "daughters"),
+    ("him", "her"),
+    ("husband", "wife"),
+    ("king", "queen"),
+    ("male", "female"),
+    ("man", "woman"),
+    ("mr.", "mrs."),
+    ("prince", "princess"),
+    ("son", "daughter"),
     ("spokesman", "spokeswoman"),
     ("stepfather", "stepmother"),
-    ("uncle", "aunt"),
-    ("wife", "husband")
+    ("uncle", "aunt")
 ]
-GENDER_DICT = {w1: w2 for w1, w2 in GENDER_PAIRS}
-GENDER_DICT.update({w2: w1 for w1, w2 in GENDER_PAIRS})
+
+# Initialiser l'outil inflect pour les pluriels
+p = inflect.engine()
+
+# Construire le dictionnaire de variantes (singulier/pluriel × lower/title/upper)
+GENDER_DICT = {}
+for masc, fem in base_pairs:
+    masc_plur = p.plural(masc)
+    fem_plur = p.plural(fem)
+    for (m_base, f_base) in [(masc, fem), (masc_plur, fem_plur)]:
+        for transform in (str.lower, str.title, str.upper):
+            m_var = transform(m_base)
+            f_var = transform(f_base)
+            GENDER_DICT[m_var] = f_var
+            GENDER_DICT[f_var] = m_var
+
 
 def swap_gender_terms(sentence, gender_dict):
-    # Découpe les tokens : mots OU ponctuation
+    # Découpe en tokens : mots ou ponctuation
     tokens = re.findall(r"\w+|[^\w\s]", sentence, re.UNICODE)
-    
     swapped = []
     for token in tokens:
-        if token in gender_dict:
-            swapped.append(gender_dict[token])
-        else:
-            swapped.append(token)
-    
-    # Reconstruire la phrase en ajoutant les espaces intelligemment
+        swapped.append(gender_dict.get(token, token))
+    # Reconstruire la phrase avec espaces intelligents
     result = ""
-    for i, token in enumerate(swapped):
-        if i > 0 and re.match(r"\w", token) and re.match(r"\w", swapped[i-1]):
+    for i, tok in enumerate(swapped):
+        if i > 0 and re.match(r"\w", tok) and re.match(r"\w", swapped[i-1]):
             result += " "
-        result += token
-
+        result += tok
     return result
 
 
@@ -108,6 +104,8 @@ def prepare_split(dataset, seed, p_env_a, output_dir):
     n_a = int(p_env_a * n)
     env_a = train_lines[:n_a]
     env_b = [swap_gender_terms(l, GENDER_DICT) for l in train_lines[n_a:]]
+    # env_a = [swap_gender_terms(l, GENDER_DICT) for l in train_lines[:n_a]]
+    # env_b = train_lines[n_a:]
 
     # write train environments
     with open(os.path.join(train_env, 'env_A.txt'), 'w', encoding='utf-8') as f:
@@ -128,7 +126,7 @@ def prepare_split(dataset, seed, p_env_a, output_dir):
         f.write("\n".join(test_lines))
 
 
-def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block_size=None, verbose=True):
+def compute_bias(model, tokenizer, test_lines, gender_dict, block_size=None, verbose=True):
     """
     Compute bias scores on test_lines: return list of B_H values.
     """
@@ -136,8 +134,7 @@ def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block
     clean_lines = []
     masked_targets = []
     model.eval()
-    if use_cuda:
-        model.to('cuda')
+    model.to('cuda')
     
     # Réplication exacte de la logique run_invariant_mlm.py
     if block_size is None:
@@ -166,9 +163,17 @@ def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block
 
     # Étape 3 — Tokenize
     def tokenize_function(example):
-        return tokenizer(example["text"])
+        return tokenizer(
+            example["text"],
+            return_special_tokens_mask=True
+        )
 
-    tokenized_dataset = raw_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    tokenized_dataset = raw_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"],
+        load_from_cache_file=not False,
+    )
 
     # Étape 4 — Group texts à la manière de run_invariant_mlm.py
     def group_texts(examples):
@@ -181,7 +186,12 @@ def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block
         result["labels"] = result["input_ids"].copy()
         return result
 
-    grouped_dataset = tokenized_dataset.map(group_texts, batched=True)
+    grouped_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True,
+        num_proc=16,
+        load_from_cache_file=not False,
+    )
 
     # Étape 5 — Évaluation manuelle
     for i, example in enumerate(tqdm(grouped_dataset, desc="Computing bias")):
@@ -189,9 +199,8 @@ def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block
         input_ids = torch.tensor(example["input_ids"]).unsqueeze(0)
         attention_mask = torch.tensor(example["attention_mask"]).unsqueeze(0)
         
-        if use_cuda:
-            input_ids = input_ids.to('cuda')
-            attention_mask = attention_mask.to('cuda')
+        input_ids = input_ids.to('cuda')
+        attention_mask = attention_mask.to('cuda')
         
         with torch.no_grad():
             out = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -240,12 +249,12 @@ def compute_bias(model, tokenizer, test_lines, gender_dict, use_cuda=True, block
 
 def main():
     # --- PRÉ-TÉLÉCHARGEMENT DES POIDS ---
-    hf_hub_download(
-        repo_id="distilbert-base-uncased",
-        filename="pytorch_model.bin",
-        force_download=False,    # n’écrase pas le cache si déjà présent
-        resume_download=True     # reprend un téléchargement partiel
-    )
+    # hf_hub_download(
+    #     repo_id="distilbert-base-uncased",
+    #     filename="pytorch_model.bin",
+    #     force_download=False,    # n’écrase pas le cache si déjà présent
+    #     resume_download=True     # reprend un téléchargement partiel
+    # )
     # → ça garantira qu’au moment du `--model_name_or_path distilbert-base-uncased`
     #   les fichiers sont déjà dans le cache, et n’iront plus frapper l’endpoint
     #   qui renvoie 503.
@@ -280,13 +289,11 @@ def main():
     for lr in learning_rates:
         for seed in seeds:
             for r in rel_sizes:
-                # calcul de p_env_a à partir de la taille relative r
                 p_env_a = 1.0 / (1.0 + r/100.0)
                 tag = f"split{seed}_r{r}"
                 split_dir = os.path.join(generated_root, tag)
                 prepare_split(dataset, seed, p_env_a, split_dir)
 
-                # vérification du fichier test
                 test_file = os.path.join(split_dir, 'val_env', 'test.txt')
                 if not os.path.exists(test_file):
                     print(f"Missing test file for {tag}, skipping.")
@@ -307,13 +314,13 @@ def main():
                             cmd = (
                                 f"python3 run_invariant_mlm.py "
                                 f"--model_name_or_path distilbert-base-uncased "
-                                f"--train_file {train_folder} "
-                                f"--validation_file {os.path.join(split_dir, 'val_env', 'val_ind.txt')} "
-                                f"--do_train --do_eval --nb_steps {steps} --learning_rate {lr} "
-                                f"--output_dir {model_path} --preprocessing_num_workers 16 "
-                                f"--seed {seed} --per_device_train_batch_size 12 "
-                                f"--preprocessing_num_workers 4 --gradient_accumulation_steps 2 "
-                                f"--fp16 --overwrite_output_dir"
+                                f"--do_train --train_file {train_folder} "
+                                f"--do_eval --validation_file {os.path.join(split_dir, 'val_env', 'val_ind.txt')} "
+                                f"--nb_steps {steps} --learning_rate {lr} "
+                                f"--output_dir {model_path} --overwrite_output_dir --preprocessing_num_workers 16 "
+                                f"--seed {seed} --per_device_train_batch_size 64 --gradient_accumulation_steps 4 "
+                                f"--max_seq_length 128 "
+                                f"--fp16 "
                             )
                             print(f"Training {method} on {tag} (lr={lr}, seed={seed})...")
                             subprocess.run(cmd, shell=True, check=True)
@@ -329,15 +336,15 @@ def main():
                             force_download=False,
                             resume_download=False
                         )
-                        if use_cuda:
-                            model.to('cuda')
+                        
+                        model.to('cuda')
+                        
                         bias_scores = compute_bias(
                             model=model,
                             tokenizer=tokenizer,
                             test_lines=test_lines,
-                            gender_dict=GENDER_DICT,  # défini quelque part globalement
-                            use_cuda=use_cuda,
-                            block_size=128            # ou 512 si c’est ce que tu utilises à l’entraînement
+                            gender_dict=GENDER_DICT,
+                            block_size=128
                         )
                         df = pd.DataFrame({'bias': bias_scores})
                         out_csv = os.path.join(
