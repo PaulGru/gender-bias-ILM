@@ -218,6 +218,9 @@ class CustomTrainingArguments(TrainingArguments):
         default=1,
         metadata={"help": "Number of head updates per encoder update (IRM Games)"}
     )
+    freeze_phi: bool = field(
+        default=False, metadata={"help": "Freeze encoder φ (no updates at all)"}
+    )
 
 
 def main():
@@ -225,7 +228,7 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, CustomTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.

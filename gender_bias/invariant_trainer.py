@@ -430,7 +430,8 @@ class InvariantTrainer(transformers.Trainer):
         **kwargs,
     ):
 
-        head_updates_per_encoder_update = getattr(self.args, "head_updates_per_encoder_update", 1)
+        K = getattr(self.args, "head_updates_per_encoder_update", 1)
+        freeze_phi = getattr(self.args, "freeze_phi", False)
 
         if "model_path" in kwargs:
             resume_from_checkpoint = kwargs.pop("model_path")
@@ -457,23 +458,32 @@ class InvariantTrainer(transformers.Trainer):
                 min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
             max_steps = num_update_steps_per_epoch * num_train_epochs
 
+
+        E = len(training_set)
+
+        head_total_steps = math.ceil(max_steps / E)
+        enc_total_steps  = math.ceil(max_steps / (K * E))
+
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
             dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
             optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.lm_heads[env_name],
-                                                                        num_training_steps=max_steps)
+                                                                        num_training_steps=head_total_steps)
             optimizers[env_name] = optimizer
             lr_schedulers[env_name] = lr_scheduler
-
-        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.encoder, num_training_steps=max_steps)
+        
+        if not freeze_phi:
+            enc_optim, enc_sched = self.create_optimizer_and_scheduler(self.model.encoder,
+                                                                    num_training_steps=enc_total_steps)
+        else:
+            # φ restera gelé ; pas d'optimizer/scheduler
+            enc_optim = enc_sched = None
+            self.model.encoder.requires_grad_(False)
 
         self.state = TrainerState()
 
         if self.args.n_gpu > 0:
             self.model.to('cuda')
-
-        if self.args.n_gpu > 1:
-            self.model = torch.nn.DataParallel(self.model)
 
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         num_examples = total_train_batch_size * max_steps
@@ -494,6 +504,9 @@ class InvariantTrainer(transformers.Trainer):
         log_every = 100
         csv_total_loss_path = os.path.join(self.args.output_dir, "train_total_loss.csv")
         csv_heads_loss_path = os.path.join(self.args.output_dir, "train_env_losses.csv")
+        last_heads_mean_loss = None
+        total_loss_val = None
+
         train_loss_log = []  # logs for phase 2 (encoder) total loss
         heads_loss_log = []  # logs for phase 1 head losses
 
@@ -511,17 +524,28 @@ class InvariantTrainer(transformers.Trainer):
 
                 # === Phase 1: update each environment-specific head ===
                 env_step_losses = {"step": total_trained_steps}
+
+                self.model.encoder.requires_grad_(False)
                 
-                for _ in range(head_updates_per_encoder_update):
-                    self.model.encoder.requires_grad_(False)
+                for _ in range(K):
                     for env_name in training_set.keys():
                         logger.info(f" Update on environement {env_name}")
+                        
+                        # 1) Freeze toutes les têtes
+                        for e_n in training_set.keys():
+                            self.model.lm_heads[e_n].requires_grad_(False)
+                        # 2) Active uniquement la tête de l’environnement courant
                         self.model.lm_heads[env_name].requires_grad_(True)
-                        optimizers[env_name].zero_grad()
 
-                        inputs = next(iter_loaders[env_name])
-                        if self.args.n_gpu > 0:
-                            inputs = inputs.to('cuda')
+                        try:
+                            inputs = next(iter_loaders[env_name])
+                        except StopIteration:
+                            iter_loaders[env_name] = iter(dataloaders[env_name])
+                            inputs = next(iter_loaders[env_name])
+
+                        inputs = self._prepare_inputs(inputs)
+
+                        optimizers[env_name].zero_grad(set_to_none=True)
 
                         loss = self.training_step(self.model, inputs)
 
@@ -541,6 +565,7 @@ class InvariantTrainer(transformers.Trainer):
                         
                         if self.use_amp:
                             self.scaler.step(optimizers[env_name])
+                            self.scaler.update()
                         else:
                             optimizers[env_name].step()
 
@@ -555,60 +580,76 @@ class InvariantTrainer(transformers.Trainer):
 
                     heads_loss_log.append(env_step_losses)
 
+                    vals = [v for k, v in env_step_losses.items() if k != "step"]
+                    if vals:
+                        import numpy as np
+                        last_heads_mean_loss = float(np.mean(vals))
+
                 # === Phase 2: update shared encoder ===
-                self.model.encoder.requires_grad_(True)
-                for env_name in training_set.keys():
-                    self.model.lm_heads[env_name].requires_grad_(False)
+                if not freeze_phi: 
+                    for env_name in training_set.keys():
+                        self.model.lm_heads[env_name].requires_grad_(False)
+                    self.model.encoder.requires_grad_(True)
 
-                optimizer.zero_grad()
-                total_loss = 0.0
-                for env_name in training_set.keys():
-                    inputs = next(iter_loaders[env_name])
-                    if self.args.n_gpu > 0:
-                        inputs = inputs.to('cuda')
-                    loss = self.training_step(self.model, inputs)
-                    total_loss += loss
+                    enc_optim.zero_grad()
+                    total_loss = 0.0
+                    for env_name in training_set.keys():
+                        try:
+                            inputs = next(iter_loaders[env_name])
+                        except StopIteration:
+                            iter_loaders[env_name] = iter(dataloaders[env_name])
+                            inputs = next(iter_loaders[env_name])
 
-                if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        inputs = self._prepare_inputs(inputs)
+
+                        loss = self.training_step(self.model, inputs)
+                        total_loss += loss
+
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        if self.use_amp:
+                            self.scaler.unscale_(enc_optim)
+
+                    if hasattr(enc_optim, "clip_grad_norm"):
+                        enc_optim.clip_grad_norm(self.args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.encoder.parameters(),
+                            self.args.max_grad_norm,
+                        )
+
                     if self.use_amp:
-                        self.scaler.unscale_(optimizer)
+                        self.scaler.step(enc_optim)
+                        self.scaler.update()
+                    else:
+                        enc_optim.step()
 
-                if hasattr(optimizer, "clip_grad_norm"):
-                    optimizer.clip_grad_norm(self.args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.encoder.parameters(),
-                        self.args.max_grad_norm,
-                    )
+                    enc_sched.step()
 
-                if self.use_amp:
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-                else:
-                    optimizer.step()
+                    total_loss_val = total_loss.item()
+                    train_loss_log.append({"step": total_trained_steps, "loss": total_loss_val/len(training_set)})
 
-                lr_scheduler.step()
-
-                total_loss_val = total_loss.item()
-                train_loss_log.append({"step": total_trained_steps, "loss": total_loss_val/len(training_set)})
-
-                if total_trained_steps % log_every == 0:
-                    pd.DataFrame(train_loss_log).to_csv(csv_total_loss_path, index=False)
-                    pd.DataFrame(heads_loss_log).to_csv(csv_heads_loss_path, index=False)
+                    if total_trained_steps % log_every == 0:
+                        pd.DataFrame(train_loss_log).to_csv(csv_total_loss_path, index=False)
+                        pd.DataFrame(heads_loss_log).to_csv(csv_heads_loss_path, index=False)
 
         if train_loss_log:
             pd.DataFrame(train_loss_log).to_csv(csv_total_loss_path, index=False)
         if heads_loss_log:
             pd.DataFrame(heads_loss_log).to_csv(csv_heads_loss_path, index=False)
 
-        return {
-            "metrics": {
-                "eval_loss": total_loss_val,
-                "nb_steps": max_steps,
-                "global_step": total_trained_steps
-            }
+        metrics = {
+            "nb_steps": max_steps,
+            "global_step": total_trained_steps,
         }
 
+        # Si φ a été mis à jour au moins une fois, on a un total_loss_val.
+        if total_loss_val is not None:
+            metrics["eval_loss"] = float(total_loss_val)
+        # Sinon (φ gelé), expose une estimation raisonnable : la moyenne des pertes de têtes du dernier cycle.
+        elif last_heads_mean_loss is not None:
+            metrics["eval_loss"] = float(last_heads_mean_loss)
+
+        return {"metrics": metrics}
 
 
     def save_intermediary_model(self, n_steps):

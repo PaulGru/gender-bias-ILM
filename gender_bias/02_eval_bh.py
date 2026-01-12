@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 04_eval_bh.py — Évaluation BH (PLL multi-token), SANS exclusion des phrases avec mots capitalisés.
+# 02_eval_bh.py — Évaluation BH (PLL multi-token), SANS exclusion des phrases avec mots capitalisés.
 # - Filtrage "strict": exactement 1 occurrence d'UN mot de la paire (a|b) + aucun autre indice de genre.
 # - Supporte les paires multi-tokens via PLL (pseudo log-vraisemblance).
 # - Sorties:

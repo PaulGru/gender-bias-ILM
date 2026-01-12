@@ -49,7 +49,9 @@ def ensure_data(out_root, rel_ba_pct, data_seed):
     return p, ptag
 
 def train(model_base, mode, data_root, ptag, steps, seed, lr, bsz=32, gradient_accumulation_steps=1, out_root="runs", extra_args=None):
-    train_dir = Path(data_root) / ("envs_"+ptag if mode=="ilm" else "erm_"+ptag)
+    
+    use_envs = mode in ("ilm", "game", "ensemble", "game_phi_fixed")
+    train_dir = Path(data_root) / ("envs_"+ptag) if use_envs else ("erm_"+ptag)
     valid_file = Path(data_root) / "valid.txt"
     out_dir = Path(out_root) / f"{mode}_wt2_{ptag}_lr{lr}_s{seed}_t{steps}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -70,14 +72,19 @@ def train(model_base, mode, data_root, ptag, steps, seed, lr, bsz=32, gradient_a
     ]
     if mode == "ilm":
         cmd += ["--mode", "ilm"]
+    elif mode in ("game", "game_phi_fixed"):
+        cmd += ["--mode", "game"]
+        if mode == "game_phi_fixed":
+            cmd += ["--freeze_phi", "true"]
     if extra_args:
         cmd += extra_args
+    
     print("[TRAIN]", " ".join(map(str, cmd)))
     subprocess.run(cmd, check=True)
     return str(out_dir)
 
 def eval_bh(model_dir, test_file, outfile_pairs, dump_used=None):
-    cmd = [sys.executable, "04_eval_bh.py",
+    cmd = [sys.executable, "02_eval_bh.py",
            "--model_dir", model_dir,
            "--test_file", test_file,
            "--max_samples", "100000",
@@ -108,7 +115,7 @@ def main():
     ap.add_argument("--data_seed", type=int, default=0, help="seed pour le split des env (fixé)")
     ap.add_argument("--data_root", default="./data/wt2_gender")
     ap.add_argument("--model_base", default="distilbert-base-uncased")
-    ap.add_argument("--runs_root", default="./runs")
+    ap.add_argument("--runs_root", default="./runs_1")
     ap.add_argument("--results_csv", default="./results_summary.csv")
     ap.add_argument("--bsz", type=int, default=32)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1,
@@ -117,7 +124,11 @@ def main():
     ap.add_argument("--eval_dump_used", action="store_true")
     ap.add_argument("--cleanup", action="store_true",
                 help="Delete heavy model files in each run dir after BH eval.")
+    ap.add_argument("--modes", default="ilm,erm",
+                help="Liste des modes à lancer: ex. ilm,erm,game,game_phi_fixed")
     args = ap.parse_args()
+
+    modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
 
     rel_ba_pcts = [float(x) for x in args.rel_ba_pcts.split(",")]
     lrs = [float(x) for x in args.lrs.split(",")]
@@ -137,7 +148,7 @@ def main():
             for lr in lrs:
                 for steps in steps_list:
                     for seed in seeds:
-                        for mode in ["ilm","erm"]:
+                        for mode in modes:
                             model_dir = train(args.model_base, mode, args.data_root, ptag, steps, seed, lr,
                                               bsz=args.bsz, out_root=args.runs_root, extra_args=extra_args)
                             pairs_csv = str(Path(model_dir) / f"bh_{mode}_{ptag}_lr{lr}_s{seed}_t{steps}.csv")

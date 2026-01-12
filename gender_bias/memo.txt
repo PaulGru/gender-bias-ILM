@@ -2,22 +2,25 @@
 python 01_make_wt2_gender_envs.py --out_root ./data/wt2_gender --p 0.50 --seed 0
 
 # 4) Évaluer le biais BH
-python 04_eval_bh.py --model_dir ./runs/ilm_wt2_p050 --test_file ./data/wt2_gender/test.txt --max_samples 5000 --outfile ilm_p050_bh.csv
-python 04_eval_bh.py --model_dir ./runs/erm_wt2_p050 --test_file ./data/wt2_gender/test.txt --max_samples 5000 --outfile erm_p050_bh.csv
+python 02_eval_bh.py --model_dir ./runs/ilm_wt2_p050 --test_file ./data/wt2_gender/test.txt --max_samples 5000 --outfile ilm_p050_bh.csv
+python 02_eval_bh.py --model_dir ./runs/erm_wt2_p050 --test_file ./data/wt2_gender/test.txt --max_samples 5000 --outfile erm_p050_bh.csv
 
 # 5) Ce script génère les données pour chaque rel_ba_pct, lance iLM et ERM pour
 # chaque triple (lr, steps, seed), puis évalue BH et écrit results_summary.csv.
-python 05_run_grid.py \
+python 03_run_grid.py \
+  --modes game,game_phi_fixed \
   --rel_ba_pcts 10,25,30,50,70,75,90,100 \
   --lrs 1e-5,5e-5 \
   --steps_list 10,50,100,200,1000,2500 \
-  --seeds 0,1,2,3,4 \
-  --extra_train_args "--max_seq_length 128"
+  --seeds 0 \
+  --runs_root ./runs_k10_both \
+  --results_csv ./results_summary_k10_both.csv \
+  --extra_train_args "--head_updates_per_encoder_update 10 --max_seq_length 128"
 
 # 6) Afficher les résultats
-python 06_make_plots.py --csv results_summary.csv --outdir ./figs
+python 04_make_plots.py --csv results_summary.csv --outdir ./figs
 
 # 7) Afficher les résultats d'entraînement
-python 07_plot_from_runs.py --runs_root ./runs --steps 2500 --outdir ./figs_training
+python 05_plot_from_runs.py --runs_root ./runs --steps 2500 --outdir ./figs_training
 
-python make_perplexity_means.py eval_results_perplexity figs/perplexity_by_mode.csv
+python 06_make_perplexity_means.py eval_results_perplexity figs/perplexity_by_mode.csv
